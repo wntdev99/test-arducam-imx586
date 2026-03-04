@@ -115,7 +115,7 @@ while true; do
         echo ""
         echo "[Run #${run}] Python died after ${elapsed}s (exit=$ec)"
 
-        if grep -q "Cannot open\|RuntimeError\|Device not ready" "$outfile"; then
+        if grep -q "Cannot open\|RuntimeError\|Device not ready\|VideoCapture.*timed out\|timed out.*device locked" "$outfile"; then
             fail "DEVICE_LOCK" "$run" "$outfile"
         else
             fail "CRASH" "$run" "$outfile"
@@ -140,7 +140,7 @@ while true; do
 
     echo "[Run #${run}] Exited (exit=$ec) after ${runtime}s"
 
-    if grep -q "Cannot open\|RuntimeError\|Device not ready" "$outfile"; then
+    if grep -q "Cannot open\|RuntimeError\|Device not ready\|VideoCapture.*timed out\|timed out.*device locked" "$outfile"; then
         fail "DEVICE_LOCK" "$run" "$outfile"
     fi
 

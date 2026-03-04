@@ -148,6 +148,11 @@ def _capture_worker(cap, interval, stop_event):
     finally:
         cap.release()
         print("[Capture] cap.release() OK", flush=True)
+        # uvcvideo 드라이버가 USB URB 비동기 정리를 완료할 때까지 대기.
+        # cap.release() 직후 다음 VideoCapture() 호출 시 VIDIOC_REQBUFS가
+        # 이전 세션의 URB 취소를 기다리며 hang하는 것을 방지한다.
+        time.sleep(2)
+        print("[Capture] USB cleanup wait done.", flush=True)
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
