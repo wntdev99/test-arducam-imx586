@@ -23,10 +23,16 @@ safe_capture.py — 장치 잠금을 완전히 차단하는 스크립트
     SIGINT 핸들러를 lambda로 stop_event.set()만 실행하도록 교체하면
     KI가 발생하지 않아 SIGABRT 방지.
 
-수정 ⑤ — SIGALRM 타임아웃 (장치 잠금 상태에서 VideoCapture hang 탈출)
-    SIGINT 블로킹 중 장치가 이전 잠금 상태이면 VideoCapture()가 무한 hang.
-    SIGALRM(SIGINT와 별개)으로 30초 타임아웃을 걸어 hang 탈출 후 RuntimeError.
-    stress 스크립트가 DEVICE_LOCK으로 정상 감지할 수 있도록 출력 포함.
+수정 ⑤ — SIGALRM 타임아웃을 VideoCapture() 생성자만 감쌈
+    이전 버전: SIGALRM을 전체 open_camera()에 걸어 워밍업과 충돌.
+    개선: VideoCapture()만 5초 SIGALRM으로 감쌈.
+      - 정상 장치: VideoCapture() < 1s → alarm 해제 → 워밍업 정상 진행
+      - 잠금 장치: VideoCapture() hang → 5s 후 SIGALRM → RuntimeError → 빠른 종료
+      - stress.sh SIGKILL(5s) 이전에 Python이 스스로 종료 → DEVICE_LOCK 정상 감지
+
+수정 ⑥ — 에러 경로 SIGINT SIG_IGN 처리
+    RuntimeError/SIGALRM timeout 처리 시 SIGINT 언블로킹 직전에
+    SIG_IGN을 설치하여 대기 중인 SIGINT가 KI로 변환되는 것을 방지.
 """
 
 import cv2
@@ -56,29 +62,37 @@ FOCUS_MAX   = int(_cfg["focus_max"])
 
 _SIGSET = {signal.SIGINT}
 
-OPEN_TIMEOUT = 30  # open_camera() 최대 허용 시간 (초)
+VIDEOCAP_TIMEOUT = 5  # VideoCapture() 생성자 최대 허용 시간 (초)
 
 
-class _OpenCameraTimeout(Exception):
+class _VideoCapTimeout(Exception):
     pass
 
 
 def _alarm_handler(sig, frame):
-    raise _OpenCameraTimeout(f"open_camera() timed out after {OPEN_TIMEOUT}s")
+    raise _VideoCapTimeout(f"VideoCapture() timed out after {VIDEOCAP_TIMEOUT}s (device locked?)")
 
 
 # ── camera open ──────────────────────────────────────────────────────────────
 def open_camera():
     """SIGINT가 블로킹된 상태에서 호출되어야 함 (main에서 보장).
 
-    cv2.VideoCapture() 및 워밍업 cap.read() 내부 V4L2 ioctl이
-    SIGINT(EINTR)로 절대 중단되지 않도록 호출자가 블로킹을 책임진다.
-    장치 잠금 상태에서 VideoCapture()가 hang하면 SIGALRM이 탈출시킨다.
+    Phase 1: VideoCapture() — SIGALRM 5초 타임아웃 (잠금 장치 hang 탈출)
+    Phase 2: 설정 + 워밍업 cap.read() — SIGINT 블로킹만 (정상 시 SIGALRM 불필요)
     """
-    cap = cv2.VideoCapture(DEVICE_PATH, cv2.CAP_V4L2)
+    # Phase 1: VideoCapture() 생성자만 SIGALRM으로 보호
+    old_alarm = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(VIDEOCAP_TIMEOUT)
+    try:
+        cap = cv2.VideoCapture(DEVICE_PATH, cv2.CAP_V4L2)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_alarm)
+
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open {DEVICE_PATH}")
 
+    # Phase 2: 설정 + 워밍업 (SIGINT 블로킹 중, SIGALRM 없음)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -139,24 +153,17 @@ def main():
     if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
         signal.signal(signal.SIGINT, signal.default_int_handler)
 
-    # 수정 ⑤ — SIGALRM 타임아웃 설정 (SIGINT와 독립적 — 블로킹 안됨)
-    old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(OPEN_TIMEOUT)
-
     # 수정 ② — open_camera() 전체를 SIGINT 블로킹 상태에서 실행
+    # (내부에서 VideoCapture() 구간만 SIGALRM 5초 타임아웃 추가)
     signal.pthread_sigmask(signal.SIG_BLOCK, _SIGSET)
     try:
         cap = open_camera()
-    except (RuntimeError, _OpenCameraTimeout) as e:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_alarm_handler)
+    except (RuntimeError, _VideoCapTimeout) as e:
+        # 수정 ⑥ — 언블로킹 전 SIG_IGN: 대기 중인 SIGINT가 KI가 되는 것을 방지
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, _SIGSET)
         print(f"[Main] {e}", flush=True)
         sys.exit(1)
-
-    # open_camera() 완료 — SIGALRM 해제
-    signal.alarm(0)
-    signal.signal(signal.SIGALRM, old_alarm_handler)
 
     interval = 1.0 / FPS
     stop_event = threading.Event()

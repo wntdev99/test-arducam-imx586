@@ -144,8 +144,10 @@ while true; do
         fail "DEVICE_LOCK" "$run" "$outfile"
     fi
 
+    # PASS 시에도 종료 직전 출력 확인 (cap.release() OK / Done 검증)
+    tail_lines=$(tail -3 "$outfile")
     rm -f "$outfile"
     success=$((success + 1))
-    echo "[Run #${run}] PASS"
+    echo "[Run #${run}] PASS  (last: $(echo "$tail_lines" | tr '\n' '|'))"
     sleep 0.2
 done
