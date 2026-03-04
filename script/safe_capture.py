@@ -78,7 +78,8 @@ def open_camera():
     """SIGINT가 블로킹된 상태에서 호출되어야 함 (main에서 보장).
 
     Phase 1: VideoCapture() — SIGALRM 5초 타임아웃 (잠금 장치 hang 탈출)
-    Phase 2: 설정 + 워밍업 cap.read() — SIGINT 블로킹만 (정상 시 SIGALRM 불필요)
+    Phase 2: 설정 + 워밍업 5프레임 — SIGINT 블로킹만, sleep 없음
+             SIGINT 도착 후 최대 대기 ≈ 4 × (1/FPS) ≈ 1.3s → 5s SIGKILL 기준 안전
     """
     # Phase 1: VideoCapture() 생성자만 SIGALRM으로 보호
     old_alarm = signal.signal(signal.SIGALRM, _alarm_handler)
@@ -105,11 +106,13 @@ def open_camera():
     fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"[Camera] Opened: {w}x{h} @ {fps} fps", flush=True)
 
+    # 워밍업: 5프레임으로 제한, sleep 없음
+    # cap.read() 자체가 1/FPS 초 대기 → 별도 sleep 불필요
+    # SIGINT 도착 후 최대 대기 = 4프레임 × (1/FPS)s ≈ 1.3s → stress.sh 5s 기준 여유 충분
     print("[Camera] Warming up ...", flush=True)
-    for i in range(10):
+    for i in range(5):
         ret, _ = cap.read()   # SIGINT 블로킹 중 → ioctl 절대 중단 불가
-        print(f"[Camera] Warm-up {i+1}/10 {'OK' if ret else 'FAIL'}", flush=True)
-        time.sleep(0.1)       # SIGINT 블로킹 중 → sleep은 그냥 대기
+        print(f"[Camera] Warm-up {i+1}/5 {'OK' if ret else 'FAIL'}", flush=True)
 
     return cap
 
