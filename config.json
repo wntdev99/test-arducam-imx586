@@ -1,0 +1,16 @@
+{
+  "device_path": "/dev/arducam_imx586",
+  "frame_width": 8000,
+  "frame_height": 6000,
+  "frame_fps": 3,
+  "focus_min": 200,
+  "focus_max": 255,
+  "reconnect_interval": 15,
+  "image_ttl": 15,
+  "image_save_interval": 3.0,
+  "image_cleanup_interval": 15,
+  "image_dir": "image",
+  "log_dir": "log",
+  "consec_fail_threshold": 1,
+  "usb_vid_pid": "04b4:0478"
+}
