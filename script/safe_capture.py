@@ -57,7 +57,7 @@ CONSEC_FAIL = int(_cfg.get("consec_fail_threshold", 3))
 _SIGSET_INT = {signal.SIGINT}
 
 VIDEOCAP_TIMEOUT = 8   # V4L2Camera.open() 최대 허용 시간 (초)
-JOIN_TIMEOUT     = 10  # stop_event 후 cam.read() 완료 최대 대기 (초)
+JOIN_TIMEOUT     = 8   # stop_event 후 cam.close() 완료 최대 대기 (초)
 OPEN_RETRIES     = 3   # 장치 열기 재시도 횟수
 OPEN_RETRY_WAIT  = 2   # 재시도 간격 (초)
 

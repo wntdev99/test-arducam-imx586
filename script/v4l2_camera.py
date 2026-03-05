@@ -18,6 +18,7 @@ import os
 import mmap
 import fcntl
 import struct
+import threading
 from pathlib import Path
 
 # ── ioctl 번호 (x86_64, 기존 코드에서 검증됨) ────────────────────────────────
@@ -137,17 +138,32 @@ class V4L2Camera:
         """안전한 cleanup: STREAMOFF → munmap → REQBUFS(0) → close → USB reset.
 
         각 단계는 개별 try/except — 이전 단계 실패해도 다음 단계 진행.
+        STREAMOFF는 D-state hang 가능 → daemon 스레드 + 3초 타임아웃.
+        타임아웃 시 skip하고 close(fd)로 진행 (커널이 release 시 cleanup).
         """
         steps = []
 
-        # Step 1: STREAMOFF
+        # Step 1: STREAMOFF (daemon 스레드 + 타임아웃)
         if self._streaming and self._fd >= 0:
-            try:
-                buf_type = struct.pack('I', V4L2_BUF_TYPE_VIDEO_CAPTURE)
-                fcntl.ioctl(self._fd, VIDIOC_STREAMOFF, buf_type)
+            fd = self._fd
+            done = threading.Event()
+
+            def _streamoff():
+                try:
+                    buf_type = struct.pack('I', V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                    fcntl.ioctl(fd, VIDIOC_STREAMOFF, buf_type)
+                except Exception:
+                    pass
+                done.set()
+
+            t = threading.Thread(target=_streamoff, daemon=True)
+            t.start()
+            t.join(timeout=3)
+
+            if done.is_set():
                 steps.append("streamoff=ok")
-            except Exception as e:
-                steps.append(f"streamoff=err({e})")
+            else:
+                steps.append("streamoff=timeout(3s)")
             self._streaming = False
 
         # Step 2: munmap
