@@ -19,7 +19,7 @@ safe_capture.py — 장치 잠금을 완전히 차단하는 스크립트
   ⑦ open_camera() 내 모든 예외 경로에서 cap.release() 보장
   ⑧ SIGTERM 핸들러 추가
   ⑨ 캡처 루프 종료 후 join(timeout) 워치독
-  ⑩ dup2(/dev/null)로 장치 fd 원자적 닫기 → 커널 전체 V4L2 cleanup 위임
+  ⑩ dup2(/dev/null) + USBDEVFS_RESET: fd 닫기 → 커널 cleanup → 펌웨어 초기화
   ⑪ 연속 read 실패 시 자동 종료
   ⑫ open_camera() 재시도 (이전 run cleanup 미완 대비)
 """
@@ -129,45 +129,70 @@ def _find_device_fd(device_path):
     return None
 
 
+def _usb_reset(device_path):
+    """USB 장치 리셋으로 카메라 펌웨어를 초기 상태로 복원.
+
+    Arducam IMX586(Cypress 컨트롤러)는 스트리밍 종료 후 펌웨어가
+    EIO 상태에 빠지는 버그가 있음. USBDEVFS_RESET으로 펌웨어를
+    강제 초기화하여 다음 세션이 깨끗한 상태에서 시작하도록 보장.
+    """
+    import fcntl
+
+    video_name = os.path.basename(os.path.realpath(device_path))
+    sysfs_device = Path(f"/sys/class/video4linux/{video_name}/device").resolve()
+    usb_dev = sysfs_device.parent
+    busnum = int((usb_dev / "busnum").read_text().strip())
+    devnum = int((usb_dev / "devnum").read_text().strip())
+    usb_path = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+
+    fd = os.open(usb_path, os.O_RDWR)
+    try:
+        USBDEVFS_RESET = 0x5514  # _IO('U', 20)
+        fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+    finally:
+        os.close(fd)
+
+
 def _release_cap_safe(cap):
-    """장치 fd를 직접 닫아 커널에 전체 V4L2 cleanup을 원자적으로 위임.
+    """장치 fd 닫기 → OpenCV 정리 → USB 리셋으로 완전한 cleanup.
 
-    기존 문제: 수동 STREAMOFF → cap.release() 순서에서 OpenCV 내부 상태와
-    V4L2 드라이버 상태가 불일치하여 장치가 EIO 상태에 빠짐.
-
-    해결: dup2(/dev/null, device_fd)로 장치 fd를 원자적으로 닫음.
-    커널의 uvc_v4l2_release()가 올바른 순서로 전체 cleanup 수행:
-      STREAMOFF → usb_kill_urb() → 버퍼 해제 → alt-setting 리셋
-    이후 cap.release()는 /dev/null에 대해 동작하므로 무해.
+    1. dup2(/dev/null): 장치 fd 원자적 닫기 → 커널 V4L2 cleanup
+    2. cap.release(): OpenCV 내부 상태 정리 (/dev/null에 대해 무해)
+    3. USBDEVFS_RESET: 카메라 펌웨어 초기화 (S_FMT EIO 방지)
     """
     if cap is None:
         return
     t0 = time.time()
-    result = "?"
+    steps = []
 
+    # Step 1: dup2로 장치 fd 닫기 → 커널 V4L2 cleanup
     try:
         dev_fd = _find_device_fd(DEVICE_PATH)
         if dev_fd is not None:
-            # dup2: 장치 fd를 /dev/null로 원자적 교체
-            # → 원래 fd close → 커널 uvc_v4l2_release() 전체 cleanup
-            # → fd 번호는 유지되므로 OpenCV가 stale fd로 다른 파일을 닫는 사고 방지
             devnull_fd = os.open("/dev/null", os.O_RDWR)
             os.dup2(devnull_fd, dev_fd)
             os.close(devnull_fd)
-            result = "dup2_ok"
+            steps.append("dup2=ok")
         else:
-            result = "no_fd"
+            steps.append("dup2=no_fd")
     except Exception as e:
-        result = f"err({e})"
+        steps.append(f"dup2=err({e})")
 
-    # OpenCV 내부 상태 정리 (fd는 /dev/null → ioctl 무해 실패, close 무해)
+    # Step 2: OpenCV 내부 상태 정리
     try:
         cap.release()
     except Exception:
         pass
 
+    # Step 3: USB 리셋 → 카메라 펌웨어 초기화
+    try:
+        _usb_reset(DEVICE_PATH)
+        steps.append("usb_reset=ok")
+    except Exception as e:
+        steps.append(f"usb_reset=err({e})")
+
     phase_info = f" sig_phase={_signal_phase}" if _signal_phase else ""
-    print(f"[Capture] cleanup={result}{phase_info} ({time.time() - t0:.2f}s)", flush=True)
+    print(f"[Capture] {' '.join(steps)}{phase_info} ({time.time() - t0:.2f}s)", flush=True)
 
 
 def _diagnose_device(device_path):
