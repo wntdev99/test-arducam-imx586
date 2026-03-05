@@ -158,18 +158,23 @@ def _release_cap_safe(cap):
     # STREAMOFF: in-flight URB 동기 취소 (예방)
     streamoff_result = "?"
     try:
+        t1 = time.time()
         if _v4l2_streamoff(DEVICE_PATH):
-            streamoff_result = "OK"
+            streamoff_result = f"OK({time.time() - t1:.2f}s)"
         else:
             streamoff_result = "skipped(no_fd)"
     except Exception as e:
         streamoff_result = f"FAIL({e})"
 
+    # STREAMOFF 직후 장치 상태 진단 (release 전)
+    mid_diag = _diagnose_device(DEVICE_PATH)
+
     # cap.release(): 스트리밍 이미 중단됨 → fd close만 수행
     release_result = "?"
     try:
+        t2 = time.time()
         cap.release()
-        release_result = "OK"
+        release_result = f"OK({time.time() - t2:.2f}s)"
     except Exception as e:
         release_result = f"FAIL({e})"
 
@@ -187,12 +192,12 @@ def _release_cap_safe(cap):
     except Exception:
         pass
 
-    # release 직후 장치 상태 진단: 이 시점에 이미 망가졌는지 확인
+    # release 직후 장치 상태 진단
     post_diag = _diagnose_device(DEVICE_PATH)
 
     # 한 줄 요약 (tail -3에 항상 노출)
     phase_info = f" sig_phase={_signal_phase}" if _signal_phase else ""
-    print(f"[Capture] STREAMOFF={streamoff_result} release={release_result}{fd_leak} post={post_diag}{phase_info} ({time.time() - t0:.1f}s)", flush=True)
+    print(f"[Capture] STREAMOFF={streamoff_result} mid={mid_diag} | release={release_result}{fd_leak} post={post_diag}{phase_info} ({time.time() - t0:.1f}s)", flush=True)
 
 
 def _diagnose_device(device_path):
