@@ -19,7 +19,7 @@ safe_capture.py — 장치 잠금을 완전히 차단하는 스크립트
   ⑦ open_camera() 내 모든 예외 경로에서 cap.release() 보장
   ⑧ SIGTERM 핸들러 추가
   ⑨ 캡처 루프 종료 후 join(timeout) 워치독
-  ⑩ cap.release() 예외 안전 + USB cleanup 보장 (release 시간 포함)
+  ⑩ VIDIOC_STREAMOFF 동기 호출로 URB 취소 선완료 후 cap.release()
   ⑪ 연속 read 실패 시 자동 종료
   ⑫ open_camera() 재시도 (이전 run cleanup 미완 대비)
 """
@@ -53,92 +53,65 @@ CONSEC_FAIL = int(_cfg.get("consec_fail_threshold", 3))
 
 _SIGSET_INT = {signal.SIGINT}
 
-VIDEOCAP_TIMEOUT    = 8   # VideoCapture() 생성자 최대 허용 시간 (초)
-JOIN_TIMEOUT        = 10  # stop_event 후 cap.read() 완료 최대 대기 (초)
-USB_CLEANUP_TIMEOUT = 10  # cap.release() 후 장치 준비 확인 최대 대기 (초)
-OPEN_RETRIES        = 3   # 장치 열기 재시도 횟수
-OPEN_RETRY_WAIT     = 2   # 재시도 간격 (초)
-USB_VID_PID         = _cfg.get("usb_vid_pid", "")
+VIDEOCAP_TIMEOUT = 8   # VideoCapture() 생성자 최대 허용 시간 (초)
+JOIN_TIMEOUT     = 10  # stop_event 후 cap.read() 완료 최대 대기 (초)
+OPEN_RETRIES     = 3   # 장치 열기 재시도 횟수
+OPEN_RETRY_WAIT  = 2   # 재시도 간격 (초)
+
+# V4L2 ioctl 상수
+_VIDIOC_STREAMOFF = 0x40045613          # _IOW('V', 19, int)
+_V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 
 
-def _find_usb_devpath(vid_pid):
-    """USB VID:PID로 /sys/bus/usb/devices/X-Y 경로를 찾는다."""
-    if not vid_pid:
-        return None
-    vid, pid = vid_pid.split(":")
-    usb_base = Path("/sys/bus/usb/devices")
-    try:
-        for dev in usb_base.iterdir():
-            id_vendor = dev / "idVendor"
-            id_product = dev / "idProduct"
-            if id_vendor.exists() and id_product.exists():
-                if (id_vendor.read_text().strip() == vid and
-                        id_product.read_text().strip() == pid):
-                    return dev
-    except OSError:
-        pass
-    return None
+def _v4l2_streamoff(device_path):
+    """VIDIOC_STREAMOFF을 동기적으로 호출하여 in-flight USB URB를 모두 취소.
 
-
-def _usb_reset(devpath):
-    """USBDEVFS_RESET ioctl로 USB 디바이스 리셋. 커널이 드라이버를 완전 재초기화."""
+    커널 내부: STREAMOFF → uvc_video_stop_transfer() → usb_kill_urb()
+    usb_kill_urb()는 URB 취소 + completion handler 완료까지 동기 대기.
+    반환 후에는 비동기 cleanup이 남지 않으므로 cap.release()가 안전.
+    """
     import fcntl
-    USBDEVFS_RESET = 0x5514
-    busnum = devpath / "busnum"
-    devnum = devpath / "devnum"
-    try:
-        bus = int(busnum.read_text().strip())
-        dev = int(devnum.read_text().strip())
-        usb_dev_path = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
-        fd = os.open(usb_dev_path, os.O_WRONLY)
+    import struct
+
+    real_device = os.path.realpath(device_path)
+    proc_fd = Path(f"/proc/{os.getpid()}/fd")
+    for entry in proc_fd.iterdir():
         try:
-            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
-        finally:
-            os.close(fd)
-        print(f"[Capture] USB reset OK ({usb_dev_path})", flush=True)
-        return True
-    except Exception as e:
-        print(f"[Capture] USB reset failed: {e}", flush=True)
-        return False
+            if os.path.realpath(str(entry)) == real_device:
+                fd = int(entry.name)
+                buf_type = struct.pack('i', _V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                fcntl.ioctl(fd, _VIDIOC_STREAMOFF, buf_type)
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def _release_cap_safe(cap):
-    """cap.release() + USB 디바이스 리셋으로 커널 드라이버 완전 재초기화. 예외 안전.
+    """STREAMOFF 동기 호출 후 cap.release(). 예외 안전.
 
-    cap.release() 후 uvcvideo 커널 드라이버 내부의 비동기 URB cleanup이
-    완료되지 않으면 다음 VideoCapture()가 실패하거나 D-state hang.
-    USBDEVFS_RESET ioctl로 USB 디바이스를 리셋하면 커널이
-    uvcvideo 드라이버를 완전 언로드/재로드하여 깨끗한 상태를 보장.
+    STREAMOFF이 모든 USB URB를 동기적으로 취소하므로,
+    이후 cap.release()는 fd close만 수행 — 비동기 cleanup 자체가 발생하지 않음.
     """
     if cap is None:
         return
     t0 = time.time()
+
+    # STREAMOFF: in-flight URB 동기 취소 (예방)
+    try:
+        if _v4l2_streamoff(DEVICE_PATH):
+            print(f"[Capture] STREAMOFF OK ({time.time() - t0:.1f}s)", flush=True)
+        else:
+            print("[Capture] STREAMOFF skipped (fd not found)", flush=True)
+    except Exception as e:
+        print(f"[Capture] STREAMOFF failed: {e}", flush=True)
+
+    # cap.release(): 스트리밍 이미 중단됨 → fd close만 수행
     try:
         cap.release()
         print(f"[Capture] cap.release() OK ({time.time() - t0:.1f}s)", flush=True)
     except Exception as e:
         print(f"[Capture] cap.release() FAILED ({time.time() - t0:.1f}s): {e}", flush=True)
-
-    # USB 디바이스 리셋 → 커널 드라이버 완전 재초기화
-    devpath = _find_usb_devpath(USB_VID_PID)
-    if devpath:
-        _usb_reset(devpath)
-
-    # 리셋 후 장치 재등록 대기: VideoCapture open으로 실제 준비 확인
-    deadline = time.time() + USB_CLEANUP_TIMEOUT
-    while time.time() < deadline:
-        try:
-            probe = cv2.VideoCapture(DEVICE_PATH, cv2.CAP_V4L2)
-            ready = probe.isOpened()
-            probe.release()
-            if ready:
-                print(f"[Capture] Device ready ({time.time() - t0:.1f}s)", flush=True)
-                return
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-    print(f"[Capture] Device readiness timeout ({USB_CLEANUP_TIMEOUT}s)", flush=True)
 
 
 # ── VideoCapture with thread-based timeout ───────────────────────────────────
