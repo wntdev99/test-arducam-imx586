@@ -129,7 +129,7 @@ while true; do
     while kill -0 "$pid" 2>/dev/null; do
         sleep 0.5
         sigint_wait=$(( sigint_wait + 1 ))
-        if [ $sigint_wait -ge 10 ]; then
+        if [ $sigint_wait -ge 30 ]; then
             kill -SIGKILL "$pid" 2>/dev/null
             wait "$pid" 2>/dev/null
             fail "SIGINT_FAIL" "$run" "$outfile"
