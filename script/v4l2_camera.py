@@ -220,7 +220,7 @@ class V4L2Camera:
         parm = bytearray(SIZEOF_V4L2_STREAMPARM)
         struct.pack_into('I', parm, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
         struct.pack_into('I', parm, 12, 1)          # timeperframe.numerator
-        struct.pack_into('I', parm, 16, self.fps)    # timeperframe.denominator
+        struct.pack_into('I', parm, 16, int(self.fps)) # timeperframe.denominator
         fcntl.ioctl(self._fd, VIDIOC_S_PARM, parm)
 
     def _reqbufs(self):
