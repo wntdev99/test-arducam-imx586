@@ -25,12 +25,14 @@ safe_capture.py — 장치 잠금을 완전히 차단하는 스크립트
 """
 
 import os
+import re
 import cv2
 import sys
 import json
 import time
 import signal
 import random
+import subprocess
 import threading
 from pathlib import Path
 
@@ -57,6 +59,61 @@ VIDEOCAP_TIMEOUT = 8   # VideoCapture() 생성자 최대 허용 시간 (초)
 JOIN_TIMEOUT     = 10  # stop_event 후 cap.read() 완료 최대 대기 (초)
 OPEN_RETRIES     = 3   # 장치 열기 재시도 횟수
 OPEN_RETRY_WAIT  = 2   # 재시도 간격 (초)
+
+_DMESG_FILTER = re.compile(
+    r"uvcvideo|usb\s+\d|xhci|video4linux|v4l2|bulk transfer|URB|VIDIOC|04b4:0478",
+    re.IGNORECASE,
+)
+
+
+def _dmesg_since(boot_ts):
+    """boot_ts 이후의 USB/V4L2 관련 dmesg 라인을 반환."""
+    try:
+        out = subprocess.run(
+            ["dmesg", "--time-format=raw", "--nopager"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except Exception:
+        return []
+    lines = []
+    for line in out.splitlines():
+        # raw format: "<timestamp> <message>"
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            ts = float(parts[0].rstrip(":"))
+        except ValueError:
+            continue
+        if ts >= boot_ts and _DMESG_FILTER.search(parts[1]):
+            lines.append(line)
+    return lines
+
+
+def _dmesg_boot_ts():
+    """현재 시각에 대응하는 dmesg raw timestamp (부팅 이후 초) 반환."""
+    try:
+        out = subprocess.run(
+            ["dmesg", "--time-format=raw", "--nopager"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        for line in reversed(out.splitlines()):
+            parts = line.split(None, 1)
+            if parts:
+                return float(parts[0].rstrip(":"))
+    except Exception:
+        pass
+    return 0.0
+
+
+def _print_dmesg(tag, lines):
+    """dmesg 라인을 태그와 함께 출력."""
+    if not lines:
+        print(f"[dmesg:{tag}] (clean)", flush=True)
+        return
+    print(f"[dmesg:{tag}] {len(lines)} line(s):", flush=True)
+    for line in lines[-20:]:  # 최대 20줄
+        print(f"  {line}", flush=True)
 
 # V4L2 ioctl 상수
 _VIDIOC_STREAMOFF = 0x40045613          # _IOW('V', 19, int)
@@ -120,10 +177,8 @@ def _videocapture_with_timeout(device_path, timeout):
 
     커널 D-state(uninterruptible sleep) hang 시 SIGALRM은 전달 불가.
     대신 daemon 스레드 + join(timeout)으로 감시.
-
-    커널 D-state(uninterruptible sleep) hang 시 SIGALRM은 전달 불가.
-    대신 daemon 스레드 + join(timeout)으로 감시.
-    타임아웃 시 메인 스레드에서 os._exit(1) → OS가 프로세스 fd 정리.
+    타임아웃 시 os._exit(1) → OS가 프로세스 fd 정리.
+    (생성자 단계이므로 스트리밍 미시작 → in-flight URB 없음 → STREAMOFF 불필요)
     """
     result = [None]
     exc = [None]
@@ -228,12 +283,17 @@ def open_camera():
 
 
 # ── 캡처 전용 스레드 ─────────────────────────────────────────────────────────
+# phase 변수: 시그널 수신 시 어떤 단계에 있었는지 기록
+_capture_phase = "init"
+
+
 def _capture_worker(cap, interval, stop_event):
     """캡처 전용 스레드.
 
     시작 즉시 SIGINT를 영구 블로킹 → cap.read() 절대 중단 불가.
     stop_event 세팅 확인 후 루프 종료, finally에서 cap.release() 보장.
     """
+    global _capture_phase
     signal.pthread_sigmask(signal.SIG_BLOCK, _SIGSET_INT)
 
     frame_n = 0
@@ -242,11 +302,15 @@ def _capture_worker(cap, interval, stop_event):
         while not stop_event.is_set():
             t0 = time.time()
 
+            _capture_phase = "focus"
             focus = random.randint(FOCUS_MIN, FOCUS_MAX)
             cap.set(cv2.CAP_PROP_FOCUS, focus)
+
+            _capture_phase = "read"
             ret, frame = cap.read()
             frame_n += 1
 
+            _capture_phase = "process"
             if ret:
                 consec_fail = 0
                 print(f"[Main] frame={frame_n} focus={focus}", flush=True)
@@ -257,12 +321,15 @@ def _capture_worker(cap, interval, stop_event):
                     print(f"[Main] {CONSEC_FAIL} consecutive failures, stopping.", flush=True)
                     break
 
+            _capture_phase = "wait"
             elapsed = time.time() - t0
             wait = interval - elapsed
             if wait > 0 and not stop_event.is_set():
                 stop_event.wait(timeout=wait)
     finally:
+        _capture_phase = "release"
         _release_cap_safe(cap)
+        _capture_phase = "done"
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -270,6 +337,10 @@ def main():
     # ① bash `&` 실행 시 SIGINT=SIG_IGN 상속 복원
     if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
         signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    # dmesg 기준 타임스탬프 기록 (이후 발생한 커널 메시지만 필터)
+    dmesg_t0 = _dmesg_boot_ts()
+    _print_dmesg("start", _dmesg_since(dmesg_t0))
 
     # ② open_camera() 전체를 SIGINT 블로킹 상태에서 실행
     signal.pthread_sigmask(signal.SIG_BLOCK, _SIGSET_INT)
@@ -281,13 +352,17 @@ def main():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, _SIGSET_INT)
         print(f"[Main] {e}", flush=True)
+        _print_dmesg("error", _dmesg_since(dmesg_t0))
         sys.exit(1)
 
     interval = 1.0 / FPS
     stop_event = threading.Event()
 
     # ④ SIGINT/SIGTERM 핸들러를 stop_event.set()으로 교체
+    # + 시그널 수신 시점의 capture phase 기록
     def _stop_handler(sig, frame):
+        signame = signal.Signals(sig).name
+        print(f"[Signal] {signame} received (phase={_capture_phase})", flush=True)
         stop_event.set()
 
     signal.signal(signal.SIGINT, _stop_handler)
@@ -316,9 +391,17 @@ def main():
         if stop_event.is_set() and t.is_alive():
             t.join(timeout=JOIN_TIMEOUT)
             if t.is_alive():
-                print(f"[Main] Capture thread stuck after {JOIN_TIMEOUT}s, forcing exit.", flush=True)
+                print(f"[Main] Capture thread stuck after {JOIN_TIMEOUT}s (phase={_capture_phase}), forcing exit.", flush=True)
+                # capture thread의 finally가 실행되지 않으므로
+                # 메인 스레드에서 STREAMOFF을 직접 호출하여 URB 동기 취소
+                try:
+                    _v4l2_streamoff(DEVICE_PATH)
+                except Exception:
+                    pass
+                _print_dmesg("exit", _dmesg_since(dmesg_t0))
                 os._exit(1)
 
+    _print_dmesg("exit", _dmesg_since(dmesg_t0))
     print("[Main] Done.", flush=True)
     sys.exit(0)
 
