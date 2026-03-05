@@ -149,26 +149,50 @@ def _release_cap_safe(cap):
 
     STREAMOFF이 모든 USB URB를 동기적으로 취소하므로,
     이후 cap.release()는 fd close만 수행 — 비동기 cleanup 자체가 발생하지 않음.
+    결과를 한 줄로 출력하여 stress.sh tail -3에 항상 노출.
     """
     if cap is None:
         return
     t0 = time.time()
 
     # STREAMOFF: in-flight URB 동기 취소 (예방)
+    streamoff_result = "?"
     try:
         if _v4l2_streamoff(DEVICE_PATH):
-            print(f"[Capture] STREAMOFF OK ({time.time() - t0:.1f}s)", flush=True)
+            streamoff_result = "OK"
         else:
-            print("[Capture] STREAMOFF skipped (fd not found)", flush=True)
+            streamoff_result = "skipped(no_fd)"
     except Exception as e:
-        print(f"[Capture] STREAMOFF failed: {e}", flush=True)
+        streamoff_result = f"FAIL({e})"
 
     # cap.release(): 스트리밍 이미 중단됨 → fd close만 수행
+    release_result = "?"
     try:
         cap.release()
-        print(f"[Capture] cap.release() OK ({time.time() - t0:.1f}s)", flush=True)
+        release_result = "OK"
     except Exception as e:
-        print(f"[Capture] cap.release() FAILED ({time.time() - t0:.1f}s): {e}", flush=True)
+        release_result = f"FAIL({e})"
+
+    # 한 줄 요약 (tail -3에 항상 노출)
+    phase_info = f" sig_phase={_signal_phase}" if _signal_phase else ""
+    print(f"[Capture] STREAMOFF={streamoff_result} release={release_result}{phase_info} ({time.time() - t0:.1f}s)", flush=True)
+
+
+def _diagnose_device(device_path):
+    """isOpened() 실패 시 raw os.open()으로 커널 vs OpenCV 문제 구분."""
+    import errno
+    real_path = os.path.realpath(device_path)
+    try:
+        fd = os.open(real_path, os.O_RDWR)
+        os.close(fd)
+        return "kernel OK, cv2 init fail"
+    except OSError as e:
+        if e.errno == errno.EBUSY:
+            return "kernel EBUSY"
+        elif e.errno == errno.ENOENT:
+            return "device missing"
+        else:
+            return f"errno={e.errno} ({os.strerror(e.errno)})"
 
 
 # ── VideoCapture with thread-based timeout ───────────────────────────────────
@@ -227,13 +251,14 @@ def open_camera():
             if cap.isOpened():
                 break  # 성공
 
-            # 장치가 반환됐지만 열리지 않음 — release 후 재시도
+            # 장치가 반환됐지만 열리지 않음 — raw open으로 원인 진단
+            diag = _diagnose_device(DEVICE_PATH)
             try:
                 cap.release()
             except Exception:
                 pass
             cap = None
-            last_err = RuntimeError(f"Cannot open {DEVICE_PATH}")
+            last_err = RuntimeError(f"Cannot open {DEVICE_PATH} ({diag})")
 
             if attempt < OPEN_RETRIES - 1:
                 print(f"[Camera] Device not ready, retry in {OPEN_RETRY_WAIT}s ...", flush=True)
@@ -285,6 +310,7 @@ def open_camera():
 # ── 캡처 전용 스레드 ─────────────────────────────────────────────────────────
 # phase 변수: 시그널 수신 시 어떤 단계에 있었는지 기록
 _capture_phase = "init"
+_signal_phase = ""  # 시그널 수신 시점의 phase 기록
 
 
 def _capture_worker(cap, interval, stop_event):
@@ -361,7 +387,9 @@ def main():
     # ④ SIGINT/SIGTERM 핸들러를 stop_event.set()으로 교체
     # + 시그널 수신 시점의 capture phase 기록
     def _stop_handler(sig, frame):
+        global _signal_phase
         signame = signal.Signals(sig).name
+        _signal_phase = _capture_phase
         print(f"[Signal] {signame} received (phase={_capture_phase})", flush=True)
         stop_event.set()
 
