@@ -179,20 +179,74 @@ def _release_cap_safe(cap):
 
 
 def _diagnose_device(device_path):
-    """isOpened() 실패 시 raw os.open()으로 커널 vs OpenCV 문제 구분."""
+    """isOpened() 실패 시 raw V4L2 ioctl로 실패 단계 진단.
+
+    순서: open → QUERYCAP → S_FMT(8000x6000 MJPG) → REQBUFS(4, MMAP)
+    각 단계 결과를 기록하고, 실패 시 해당 errno 포함.
+    fd close 시 커널이 할당된 버퍼 등 모든 리소스 자동 해제.
+    """
     import errno
+    import fcntl
+    import struct
+
     real_path = os.path.realpath(device_path)
+
+    # Step 1: open
     try:
         fd = os.open(real_path, os.O_RDWR)
-        os.close(fd)
-        return "kernel OK, cv2 init fail"
     except OSError as e:
         if e.errno == errno.EBUSY:
             return "kernel EBUSY"
         elif e.errno == errno.ENOENT:
             return "device missing"
         else:
-            return f"errno={e.errno} ({os.strerror(e.errno)})"
+            return f"open err{e.errno}({os.strerror(e.errno)})"
+
+    results = []
+    try:
+        # Step 2: VIDIOC_QUERYCAP — _IOR('V', 0, 104)
+        try:
+            buf = bytearray(104)
+            fcntl.ioctl(fd, 0x80685600, buf)
+            results.append("QUERYCAP=OK")
+        except OSError as e:
+            results.append(f"QUERYCAP=err{e.errno}")
+            return " ".join(results)
+
+        # Step 3: VIDIOC_S_FMT — _IOWR('V', 5, 208)
+        try:
+            fmt = bytearray(208)
+            struct.pack_into('I', fmt, 0, 1)           # type = VIDEO_CAPTURE
+            struct.pack_into('I', fmt, 4, WIDTH)       # width
+            struct.pack_into('I', fmt, 8, HEIGHT)      # height
+            struct.pack_into('I', fmt, 12, 0x47504A4D) # pixelformat = MJPG
+            fcntl.ioctl(fd, 0xc0d05605, fmt)
+            actual_w = struct.unpack_from('I', fmt, 4)[0]
+            actual_h = struct.unpack_from('I', fmt, 8)[0]
+            results.append(f"S_FMT=OK({actual_w}x{actual_h})")
+        except OSError as e:
+            results.append(f"S_FMT=err{e.errno}({os.strerror(e.errno)})")
+            return " ".join(results)
+
+        # Step 4: VIDIOC_REQBUFS — _IOWR('V', 8, 20)
+        try:
+            reqbuf = bytearray(20)
+            struct.pack_into('I', reqbuf, 0, 4)  # count = 4
+            struct.pack_into('I', reqbuf, 4, 1)  # type = VIDEO_CAPTURE
+            struct.pack_into('I', reqbuf, 8, 1)  # memory = MMAP
+            fcntl.ioctl(fd, 0xc0145608, reqbuf)
+            granted = struct.unpack_from('I', reqbuf, 0)[0]
+            results.append(f"REQBUFS=OK({granted})")
+        except OSError as e:
+            results.append(f"REQBUFS=err{e.errno}({os.strerror(e.errno)})")
+            return " ".join(results)
+
+        # 모든 ioctl 성공 — OpenCV 내부 문제
+        results.append("cv2_internal_fail")
+        return " ".join(results)
+
+    finally:
+        os.close(fd)
 
 
 # ── VideoCapture with thread-based timeout ───────────────────────────────────
