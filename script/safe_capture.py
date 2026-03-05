@@ -19,7 +19,7 @@ safe_capture.py — 장치 잠금을 완전히 차단하는 스크립트
   ⑦ open_camera() 내 모든 예외 경로에서 cap.release() 보장
   ⑧ SIGTERM 핸들러 추가
   ⑨ 캡처 루프 종료 후 join(timeout) 워치독
-  ⑩ dup2(/dev/null) + USBDEVFS_RESET: fd 닫기 → 커널 cleanup → 펌웨어 초기화
+  ⑩ cap.release() + USBDEVFS_RESET: OpenCV cleanup → 펌웨어 초기화
   ⑪ 연속 read 실패 시 자동 종료
   ⑫ open_camera() 재시도 (이전 run cleanup 미완 대비)
 """
@@ -116,29 +116,20 @@ def _print_dmesg(tag, lines):
         print(f"  {line}", flush=True)
 
 
-def _find_device_fd(device_path):
-    """프로세스가 열고 있는 장치의 fd 번호를 찾아 반환. 없으면 None."""
-    real_device = os.path.realpath(device_path)
-    proc_fd = Path(f"/proc/{os.getpid()}/fd")
-    for entry in proc_fd.iterdir():
-        try:
-            if os.path.realpath(str(entry)) == real_device:
-                return int(entry.name)
-        except (OSError, ValueError):
-            continue
-    return None
-
-
 def _usb_reset(device_path):
     """USB 장치 리셋으로 카메라 펌웨어를 초기 상태로 복원.
 
     Arducam IMX586(Cypress 컨트롤러)는 스트리밍 종료 후 펌웨어가
     EIO 상태에 빠지는 버그가 있음. USBDEVFS_RESET으로 펌웨어를
     강제 초기화하여 다음 세션이 깨끗한 상태에서 시작하도록 보장.
+
+    주의: cap.release() 후 호출해야 함. 장치 fd가 열려있으면 리셋이
+    드라이버 재바인딩을 트리거하여 /dev/videoN이 일시 사라질 수 있음.
     """
     import fcntl
 
-    video_name = os.path.basename(os.path.realpath(device_path))
+    real_path = os.path.realpath(device_path)
+    video_name = os.path.basename(real_path)
     sysfs_device = Path(f"/sys/class/video4linux/{video_name}/device").resolve()
     usb_dev = sysfs_device.parent
     busnum = int((usb_dev / "busnum").read_text().strip())
@@ -154,37 +145,27 @@ def _usb_reset(device_path):
 
 
 def _release_cap_safe(cap):
-    """장치 fd 닫기 → OpenCV 정리 → USB 리셋으로 완전한 cleanup.
+    """cap.release() → USB 리셋으로 완전한 cleanup.
 
-    1. dup2(/dev/null): 장치 fd 원자적 닫기 → 커널 V4L2 cleanup
-    2. cap.release(): OpenCV 내부 상태 정리 (/dev/null에 대해 무해)
-    3. USBDEVFS_RESET: 카메라 펌웨어 초기화 (S_FMT EIO 방지)
+    1. cap.release(): OpenCV 표준 V4L2 cleanup (STREAMOFF → munmap → close)
+    2. USBDEVFS_RESET: 카메라 펌웨어 초기화 (S_FMT EIO 방지)
+
+    cap.release()가 EIO 상태를 남겨도 USB 리셋이 펌웨어를 초기화.
+    dup2 트릭 불필요 — OpenCV가 정상적으로 cleanup하도록 둠.
     """
     if cap is None:
         return
     t0 = time.time()
     steps = []
 
-    # Step 1: dup2로 장치 fd 닫기 → 커널 V4L2 cleanup
-    try:
-        dev_fd = _find_device_fd(DEVICE_PATH)
-        if dev_fd is not None:
-            devnull_fd = os.open("/dev/null", os.O_RDWR)
-            os.dup2(devnull_fd, dev_fd)
-            os.close(devnull_fd)
-            steps.append("dup2=ok")
-        else:
-            steps.append("dup2=no_fd")
-    except Exception as e:
-        steps.append(f"dup2=err({e})")
-
-    # Step 2: OpenCV 내부 상태 정리
+    # Step 1: OpenCV 표준 cleanup
     try:
         cap.release()
-    except Exception:
-        pass
+        steps.append("release=ok")
+    except Exception as e:
+        steps.append(f"release=err({e})")
 
-    # Step 3: USB 리셋 → 카메라 펌웨어 초기화
+    # Step 2: USB 리셋 → 카메라 펌웨어 초기화
     try:
         _usb_reset(DEVICE_PATH)
         steps.append("usb_reset=ok")
@@ -491,16 +472,8 @@ def main():
             t.join(timeout=JOIN_TIMEOUT)
             if t.is_alive():
                 print(f"[Main] Capture thread stuck after {JOIN_TIMEOUT}s (phase={_capture_phase}), forcing exit.", flush=True)
-                # capture thread의 finally가 실행되지 않으므로
-                # 메인 스레드에서 장치 fd를 직접 닫아 커널 cleanup 유도
-                try:
-                    dev_fd = _find_device_fd(DEVICE_PATH)
-                    if dev_fd is not None:
-                        devnull_fd = os.open("/dev/null", os.O_RDWR)
-                        os.dup2(devnull_fd, dev_fd)
-                        os.close(devnull_fd)
-                except Exception:
-                    pass
+                # capture thread가 stuck → os._exit()로 프로세스 종료
+                # OS가 모든 fd를 닫아 커널 V4L2 cleanup 수행
                 _print_dmesg("exit", _dmesg_since(dmesg_t0))
                 os._exit(1)
 
