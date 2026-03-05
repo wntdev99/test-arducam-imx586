@@ -173,9 +173,26 @@ def _release_cap_safe(cap):
     except Exception as e:
         release_result = f"FAIL({e})"
 
+    # fd leak 확인: release 후에도 장치 fd가 열려있는지 검사
+    fd_leak = ""
+    real_dev = os.path.realpath(DEVICE_PATH)
+    proc_fd = Path(f"/proc/{os.getpid()}/fd")
+    try:
+        leaked_fds = [
+            e.name for e in proc_fd.iterdir()
+            if os.path.realpath(str(e)) == real_dev
+        ]
+        if leaked_fds:
+            fd_leak = f" fd_leak={','.join(leaked_fds)}"
+    except Exception:
+        pass
+
+    # release 직후 장치 상태 진단: 이 시점에 이미 망가졌는지 확인
+    post_diag = _diagnose_device(DEVICE_PATH)
+
     # 한 줄 요약 (tail -3에 항상 노출)
     phase_info = f" sig_phase={_signal_phase}" if _signal_phase else ""
-    print(f"[Capture] STREAMOFF={streamoff_result} release={release_result}{phase_info} ({time.time() - t0:.1f}s)", flush=True)
+    print(f"[Capture] STREAMOFF={streamoff_result} release={release_result}{fd_leak} post={post_diag}{phase_info} ({time.time() - t0:.1f}s)", flush=True)
 
 
 def _diagnose_device(device_path):
