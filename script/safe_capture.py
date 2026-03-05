@@ -19,7 +19,7 @@ safe_capture.py — 장치 잠금을 완전히 차단하는 스크립트
   ⑦ open_camera() 내 모든 예외 경로에서 cap.release() 보장
   ⑧ SIGTERM 핸들러 추가
   ⑨ 캡처 루프 종료 후 join(timeout) 워치독
-  ⑩ VIDIOC_STREAMOFF 동기 호출로 URB 취소 선완료 후 cap.release()
+  ⑩ dup2(/dev/null)로 장치 fd 원자적 닫기 → 커널 전체 V4L2 cleanup 위임
   ⑪ 연속 read 실패 시 자동 종료
   ⑫ open_camera() 재시도 (이전 run cleanup 미완 대비)
 """
@@ -115,89 +115,59 @@ def _print_dmesg(tag, lines):
     for line in lines[-20:]:  # 최대 20줄
         print(f"  {line}", flush=True)
 
-# V4L2 ioctl 상수
-_VIDIOC_STREAMOFF = 0x40045613          # _IOW('V', 19, int)
-_V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 
-
-def _v4l2_streamoff(device_path):
-    """VIDIOC_STREAMOFF을 동기적으로 호출하여 in-flight USB URB를 모두 취소.
-
-    커널 내부: STREAMOFF → uvc_video_stop_transfer() → usb_kill_urb()
-    usb_kill_urb()는 URB 취소 + completion handler 완료까지 동기 대기.
-    반환 후에는 비동기 cleanup이 남지 않으므로 cap.release()가 안전.
-    """
-    import fcntl
-    import struct
-
+def _find_device_fd(device_path):
+    """프로세스가 열고 있는 장치의 fd 번호를 찾아 반환. 없으면 None."""
     real_device = os.path.realpath(device_path)
     proc_fd = Path(f"/proc/{os.getpid()}/fd")
     for entry in proc_fd.iterdir():
         try:
             if os.path.realpath(str(entry)) == real_device:
-                fd = int(entry.name)
-                buf_type = struct.pack('i', _V4L2_BUF_TYPE_VIDEO_CAPTURE)
-                fcntl.ioctl(fd, _VIDIOC_STREAMOFF, buf_type)
-                return True
+                return int(entry.name)
         except (OSError, ValueError):
             continue
-    return False
+    return None
 
 
 def _release_cap_safe(cap):
-    """STREAMOFF 동기 호출 후 cap.release(). 예외 안전.
+    """장치 fd를 직접 닫아 커널에 전체 V4L2 cleanup을 원자적으로 위임.
 
-    STREAMOFF이 모든 USB URB를 동기적으로 취소하므로,
-    이후 cap.release()는 fd close만 수행 — 비동기 cleanup 자체가 발생하지 않음.
-    결과를 한 줄로 출력하여 stress.sh tail -3에 항상 노출.
+    기존 문제: 수동 STREAMOFF → cap.release() 순서에서 OpenCV 내부 상태와
+    V4L2 드라이버 상태가 불일치하여 장치가 EIO 상태에 빠짐.
+
+    해결: dup2(/dev/null, device_fd)로 장치 fd를 원자적으로 닫음.
+    커널의 uvc_v4l2_release()가 올바른 순서로 전체 cleanup 수행:
+      STREAMOFF → usb_kill_urb() → 버퍼 해제 → alt-setting 리셋
+    이후 cap.release()는 /dev/null에 대해 동작하므로 무해.
     """
     if cap is None:
         return
     t0 = time.time()
+    result = "?"
 
-    # STREAMOFF: in-flight URB 동기 취소 (예방)
-    streamoff_result = "?"
     try:
-        t1 = time.time()
-        if _v4l2_streamoff(DEVICE_PATH):
-            streamoff_result = f"OK({time.time() - t1:.2f}s)"
+        dev_fd = _find_device_fd(DEVICE_PATH)
+        if dev_fd is not None:
+            # dup2: 장치 fd를 /dev/null로 원자적 교체
+            # → 원래 fd close → 커널 uvc_v4l2_release() 전체 cleanup
+            # → fd 번호는 유지되므로 OpenCV가 stale fd로 다른 파일을 닫는 사고 방지
+            devnull_fd = os.open("/dev/null", os.O_RDWR)
+            os.dup2(devnull_fd, dev_fd)
+            os.close(devnull_fd)
+            result = "dup2_ok"
         else:
-            streamoff_result = "skipped(no_fd)"
+            result = "no_fd"
     except Exception as e:
-        streamoff_result = f"FAIL({e})"
+        result = f"err({e})"
 
-    # STREAMOFF 직후 장치 상태 진단 (release 전)
-    mid_diag = _diagnose_device(DEVICE_PATH)
-
-    # cap.release(): 스트리밍 이미 중단됨 → fd close만 수행
-    release_result = "?"
+    # OpenCV 내부 상태 정리 (fd는 /dev/null → ioctl 무해 실패, close 무해)
     try:
-        t2 = time.time()
         cap.release()
-        release_result = f"OK({time.time() - t2:.2f}s)"
-    except Exception as e:
-        release_result = f"FAIL({e})"
-
-    # fd leak 확인: release 후에도 장치 fd가 열려있는지 검사
-    fd_leak = ""
-    real_dev = os.path.realpath(DEVICE_PATH)
-    proc_fd = Path(f"/proc/{os.getpid()}/fd")
-    try:
-        leaked_fds = [
-            e.name for e in proc_fd.iterdir()
-            if os.path.realpath(str(e)) == real_dev
-        ]
-        if leaked_fds:
-            fd_leak = f" fd_leak={','.join(leaked_fds)}"
     except Exception:
         pass
 
-    # release 직후 장치 상태 진단
-    post_diag = _diagnose_device(DEVICE_PATH)
-
-    # 한 줄 요약 (tail -3에 항상 노출)
     phase_info = f" sig_phase={_signal_phase}" if _signal_phase else ""
-    print(f"[Capture] STREAMOFF={streamoff_result} mid={mid_diag} | release={release_result}{fd_leak} post={post_diag}{phase_info} ({time.time() - t0:.1f}s)", flush=True)
+    print(f"[Capture] cleanup={result}{phase_info} ({time.time() - t0:.2f}s)", flush=True)
 
 
 def _diagnose_device(device_path):
@@ -497,9 +467,13 @@ def main():
             if t.is_alive():
                 print(f"[Main] Capture thread stuck after {JOIN_TIMEOUT}s (phase={_capture_phase}), forcing exit.", flush=True)
                 # capture thread의 finally가 실행되지 않으므로
-                # 메인 스레드에서 STREAMOFF을 직접 호출하여 URB 동기 취소
+                # 메인 스레드에서 장치 fd를 직접 닫아 커널 cleanup 유도
                 try:
-                    _v4l2_streamoff(DEVICE_PATH)
+                    dev_fd = _find_device_fd(DEVICE_PATH)
+                    if dev_fd is not None:
+                        devnull_fd = os.open("/dev/null", os.O_RDWR)
+                        os.dup2(devnull_fd, dev_fd)
+                        os.close(devnull_fd)
                 except Exception:
                     pass
                 _print_dmesg("exit", _dmesg_since(dmesg_t0))
